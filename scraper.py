@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import random
@@ -13,11 +14,20 @@ import cloudscraper
 # Settings fetched from environment variables
 BASE_URL = os.getenv("BASE_URL")
 DEFAULT_STREAM_DOMAIN = "chatgpt.hereisman.net"
-OUTPUT_FILE = "Goozapp.json"  # Changed output file name
+OUTPUT_FILE = "Goozapp.json"
 
 def get_ist_time():
     ist = pytz.timezone('Asia/Kolkata')
     return datetime.now(ist).strftime('%d/%m/%y %H:%M:%S IST')
+
+def log_to_console(message):
+    """Prints logs to sys.stderr so they appear in GitHub Actions but do not pollute the raw JSON output."""
+    print(message, file=sys.stderr)
+
+def deduplicate(seq):
+    """Helper function to remove duplicates while preserving order."""
+    seen = set()
+    return [x for x in seq if not (x in seen or seen.add(x))]
 
 def push_to_github():
     GITHUB_TOKEN = os.getenv("GH_TOKEN")
@@ -26,7 +36,7 @@ def push_to_github():
     GITHUB_EMAIL = os.getenv("TGITHUB_EMAIL")
     
     if not GITHUB_TOKEN or not GITHUB_USER or not GITHUB_REPO:
-        print("[ERROR] GitHub secrets are missing. Skipping push.")
+        log_to_console("[ERROR] GitHub secrets are missing. Skipping push.")
         return
 
     temp_dir = "temp_external_repo"
@@ -55,12 +65,12 @@ def push_to_github():
         shutil.rmtree(temp_dir)
         
         if push_status == 0:
-            print(f"[SUCCESS] {OUTPUT_FILE} successfully updated in {GITHUB_USER}/{GITHUB_REPO}.")
+            log_to_console(f"[SUCCESS] {OUTPUT_FILE} successfully updated in {GITHUB_USER}/{GITHUB_REPO}.")
         else:
-            print("[ERROR] Git push command failed.")
+            log_to_console("[ERROR] Git push command failed.")
             
     except Exception as e:
-        print(f"[ERROR] Push failed: {e}")
+        log_to_console(f"[ERROR] Push failed: {e}")
 
 def run_scraper():
     # Verify if BASE_URL secret is provided
@@ -78,9 +88,11 @@ def run_scraper():
     raw_matches = []
     active_stream_domain = ""
     
+    log_to_console(f"[*] Loading homepage: {BASE_URL}/index1")
     try:
         res = scraper.get(f"{BASE_URL}/index1", timeout=15)
         homepage_html = res.text
+        log_to_console("[+] Homepage loaded successfully.")
     except Exception as e:
         error_package = OrderedDict([
             ("Owner", "Ivan-FluX"),
@@ -94,6 +106,7 @@ def run_scraper():
 
     # Extract sports categories and matches blocks
     blocks = re.findall(r'<div class="col-lg-12">\s*<h4>(.*?)</h4>.*?<ol[^>]*>(.*?)</ol>', homepage_html, re.S)
+    log_to_console(f"[+] Total {len(blocks)} categories found.")
     
     for cat_name, block_html in blocks:
         cat_name = cat_name.strip()
@@ -127,18 +140,37 @@ def run_scraper():
             })
 
     # Pass 1: Scan active matches silently to find the streaming domain and stream IDs
+    log_to_console(f"\n[*] Scanning {len(raw_matches)} matches for server IDs...")
     for item in raw_matches:
+        log_to_console(f"  [-] Fetching page: {item['clean_rivals']}...")
         try:
-            time.sleep(random.uniform(0.3, 0.7))
+            # Safe delay to prevent getting blocked by Cloudflare
+            time.sleep(random.uniform(0.8, 1.5))
             m_res = scraper.get(item["full_m_url"], timeout=10)
             m_html = m_res.text
             
-            # 1. Extract stream IDs directly from the window.changeStream(ID) buttons
-            stream_ids = re.findall(r'changeStream\s*\(\s*(\d+)\s*\)', m_html)
+            # Extract stream IDs from different potential patterns
+            stream_ids = []
+            
+            # Pattern 1: changeStream(ID)
+            stream_ids.extend(re.findall(r'changeStream\s*\(\s*(\d+)\s*\)', m_html))
+            
+            # Pattern 2: stream-btn-ID
+            stream_ids.extend(re.findall(r'stream-btn-(\d+)', m_html))
+            
+            # Pattern 3: new-stream-embed/ID
+            stream_ids.extend(re.findall(r'new-stream-embed/(\d+)', m_html))
+            
+            # Pattern 4: any generic embed path
+            stream_ids.extend(re.findall(r'embed/(\d+)', m_html))
+            
             if stream_ids:
                 item["extracted_ids"] = deduplicate(stream_ids)
+                log_to_console(f"    [+] Extracted IDs: {item['extracted_ids']}")
+            else:
+                log_to_console("    [!] No stream IDs found in page HTML.")
             
-            # 2. Extract active stream domain from the iframe source
+            # Extract active stream domain from the iframe source
             if not active_stream_domain:
                 iframe_matches = re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', m_html, re.I)
                 for iframe_url in deduplicate(iframe_matches):
@@ -154,14 +186,17 @@ def run_scraper():
                         if playlist_match:
                             parsed_url = urlparse(playlist_match.group(1))
                             active_stream_domain = parsed_url.netloc
+                            log_to_console(f"    [*] Active domain detected: {active_stream_domain}")
                             break
                     except Exception:
                         continue
-        except Exception:
+        except Exception as e:
+            log_to_console(f"    [ERROR] Failed to fetch or parse: {e}")
             continue
 
     if not active_stream_domain:
         active_stream_domain = DEFAULT_STREAM_DOMAIN
+        log_to_console(f"\n[!] Using default domain: {active_stream_domain}")
 
     # Pass 2: Generate final server-categorized links with Referer formatting
     all_live_matches = []
@@ -193,7 +228,7 @@ def run_scraper():
     # Structure final JSON package
     final_package = OrderedDict([
         ("Owner", "Ivan-FluX"),
-        ("App name", "Goozapp-auto-scraper"),  # Changed App name metadata
+        ("App name", "Goozapp-auto-scraper"),
         ("Last update", get_ist_time()),
         ("Total_Matches", len(all_live_matches)),
         ("Live_Data", all_live_matches)
@@ -205,6 +240,9 @@ def run_scraper():
         
     # Push to target repository
     push_to_github()
+    
+    # Print raw formatted JSON output to standard output only
+    print(json.dumps(final_package, indent=4))
 
 if __name__ == "__main__":
     run_scraper()
