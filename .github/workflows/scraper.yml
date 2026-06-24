@@ -3,7 +3,7 @@ name: Auto Stream Scraper
 on:
   repository_dispatch:
     types: [trigger-scraper]
-  workflow_dispatch: # এটি দিয়ে গিটহাব থেকে ম্যানুয়ালিও রান করতে পারবেন
+  workflow_dispatch:
 
 jobs:
   run-scraper:
@@ -24,6 +24,7 @@ jobs:
 
       - name: Run Scraper Script
         env:
+          BASE_URL: ${{ secrets.BASE_URL }}  # Added BASE_URL from GitHub Secrets
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TGITHUB_USER: ${{ secrets.TGITHUB_USER }}
           TGITHUB_REPO: ${{ secrets.TGITHUB_REPO }}
