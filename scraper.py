@@ -88,10 +88,24 @@ def run_scraper():
     raw_matches = []
     active_stream_domain = ""
     
-    log_to_console(f"[*] Loading homepage: {BASE_URL}/index1")
+    # Clean up base URL and support root/v8 automatically
+    clean_base = BASE_URL.rstrip('/')
+    if clean_base.endswith('/index1'):
+        clean_base = clean_base[:-7]
+
+    target_url = clean_base
+    log_to_console(f"[*] Loading homepage: {target_url}")
     try:
-        res = scraper.get(f"{BASE_URL}/index1", timeout=15)
+        res = scraper.get(target_url, timeout=15)
         homepage_html = res.text
+        
+        # If the root page didn't contain matches, try fallback endpoint /v8
+        if 'list-group-item' not in homepage_html and not clean_base.endswith('/v8'):
+            target_url = f"{clean_base}/v8"
+            log_to_console(f"[*] Retrying with fallback endpoint: {target_url}")
+            res = scraper.get(target_url, timeout=15)
+            homepage_html = res.text
+            
         log_to_console("[+] Homepage loaded successfully.")
     except Exception as e:
         error_package = OrderedDict([
@@ -104,85 +118,116 @@ def run_scraper():
         print(json.dumps(error_package, indent=4))
         return
 
-    # Extract sports categories and matches blocks
-    blocks = re.findall(r'<div class="col-lg-12">\s*<h4>(.*?)</h4>.*?<ol[^>]*>(.*?)</ol>', homepage_html, re.S)
-    log_to_console(f"[+] Total {len(blocks)} categories found.")
+    # Extract all matches directly from list-group items
+    matches = re.findall(r'<a class="list-group-item"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', homepage_html, re.S)
+    log_to_console(f"[+] Total {len(matches)} raw matches found.")
     
-    for cat_name, block_html in blocks:
-        cat_name = cat_name.strip()
-        matches = re.findall(r'<a class="list-group-item"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', block_html, re.S)
+    for m_url, m_text in matches:
+        # Skip matches that are already ended, finished, or final
+        if re.search(r'\b(ended|finished|final)\b', m_text, re.I):
+            continue
+            
+        # Extract Category / League name from <strong> tag or fallback to URL
+        cat_match = re.search(r'<strong>(.*?)</strong>', m_text, re.I)
+        if cat_match:
+            cat_name = cat_match.group(1).strip()
+        else:
+            cat_url_match = re.search(r'/tv-live/([^/]+)/', m_url)
+            cat_name = cat_url_match.group(1).upper() if cat_url_match else "Live Sports"
+
+        # Clean match name by stripping logo spans, badges, and trailing colons
+        temp_text = re.sub(r'<span[^>]*>\s*<img[^>]*>.*?</span>', '', m_text, flags=re.S | re.I)
+        temp_text = re.sub(r'<strong[^>]*>.*?</strong>', '', temp_text, flags=re.S | re.I)
+        temp_text = re.sub(r'<span[^>]*class=["\'][^"\']*time-badge[^"\']*["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
+        temp_text = re.sub(r'<span[^>]*class=["\'][^"\']*hd-text[^"\']*["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
         
-        for m_url, m_text in matches:
-            # Skip matches that are already ended or finished
-            if re.search(r'\b(ended|finished)\b', m_text, re.I):
-                continue
-                
-            # Clean match name
-            clean_rivals = re.sub(r'<[^>]+>', '', m_text)
-            clean_rivals = re.sub(r'\s+', ' ', clean_rivals).strip()
-            
-            # Remove any time badges if present in the text
-            if ":" in clean_rivals:
-                clean_rivals = clean_rivals.split(":")[0].strip()
-                
-            full_m_url = m_url if m_url.startswith("http") else f"{BASE_URL}/{m_url.lstrip('/')}"
-            
-            # Extract numeric match ID from URL as a backup
-            match_id_search = re.search(r'/(\d+)/?$', full_m_url)
-            match_id = match_id_search.group(1) if match_id_search else ""
-            
-            raw_matches.append({
-                "cat_name": cat_name,
-                "clean_rivals": clean_rivals,
-                "full_m_url": full_m_url,
-                "backup_id": match_id,
-                "extracted_ids": []
-            })
+        clean_rivals = re.sub(r'<[^>]+>', '', temp_text)
+        clean_rivals = re.sub(r'\s+', ' ', clean_rivals).strip()
+        clean_rivals = clean_rivals.rstrip(':').strip()
+        
+        full_m_url = m_url if m_url.startswith("http") else urljoin(clean_base, m_url)
+        
+        # Extract numeric match ID from URL as backup
+        match_id_search = re.search(r'/(\d+)/?$', full_m_url)
+        match_id = match_id_search.group(1) if match_id_search else ""
+        
+        raw_matches.append({
+            "cat_name": cat_name,
+            "clean_rivals": clean_rivals,
+            "full_m_url": full_m_url,
+            "backup_id": match_id,
+            "extracted_ids": []
+        })
 
     # Pass 1: Scan active matches silently to find the streaming domain and stream IDs
     log_to_console(f"\n[*] Scanning {len(raw_matches)} matches for server IDs...")
     for item in raw_matches:
         log_to_console(f"  [-] Fetching page: {item['clean_rivals']}...")
         try:
-            # Safe delay to prevent getting blocked by Cloudflare
+            # Safe delay to prevent Cloudflare rate-limits
             time.sleep(random.uniform(0.8, 1.5))
             m_res = scraper.get(item["full_m_url"], timeout=10)
             m_html = m_res.text
             
+            # Skip if match page states it is Final
+            if re.search(r'\bFinal at\b', m_html, re.I):
+                log_to_console("    [!] Match is already final. Skipping stream extraction.")
+                continue
+
             # Extract stream IDs from different potential patterns
             stream_ids = []
             
             # Pattern 1: changeStream(ID)
-            stream_ids.extend(re.findall(r'changeStream\s*\(\s*(\d+)\s*\)', m_html))
+            stream_ids.extend(re.findall(r'changeStream\s*\(\s*[\'"]?([a-zA-Z0-9_-]+)[\'"]?\s*\)', m_html))
             
             # Pattern 2: stream-btn-ID
-            stream_ids.extend(re.findall(r'stream-btn-(\d+)', m_html))
+            stream_ids.extend(re.findall(r'stream-btn-([a-zA-Z0-9_-]+)', m_html))
             
             # Pattern 3: new-stream-embed/ID
-            stream_ids.extend(re.findall(r'new-stream-embed/(\d+)', m_html))
+            stream_ids.extend(re.findall(r'new-stream-embed/([a-zA-Z0-9_-]+)', m_html))
             
             # Pattern 4: any generic embed path
-            stream_ids.extend(re.findall(r'embed/(\d+)', m_html))
+            stream_ids.extend(re.findall(r'embed/([a-zA-Z0-9_-]+)', m_html))
             
-            if stream_ids:
-                item["extracted_ids"] = deduplicate(stream_ids)
+            # Filter out non-ID javascript variables
+            filtered_ids = [
+                s for s in stream_ids 
+                if s.lower() not in ('streamid', 'null', 'undefined', 'cx-iframe')
+            ]
+            
+            if filtered_ids:
+                item["extracted_ids"] = deduplicate(filtered_ids)
                 log_to_console(f"    [+] Extracted IDs: {item['extracted_ids']}")
             else:
-                log_to_console("    [!] No stream IDs found in page HTML.")
-            
-            # Extract active stream domain from the iframe source
+                log_to_console("    [!] No stream buttons found in HTML.")
+
+            # Extract active stream domain from iframe or embed URL
             if not active_stream_domain:
-                iframe_matches = re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', m_html, re.I)
-                for iframe_url in deduplicate(iframe_matches):
-                    if not iframe_url.startswith('http'):
-                        if iframe_url.startswith('//'):
-                            iframe_url = 'https:' + iframe_url
+                candidate_embed_urls = []
+                
+                # Check static iframes
+                candidate_embed_urls.extend(re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', m_html, re.I))
+                
+                # Check dynamic embed URLs in script
+                candidate_embed_urls.extend(re.findall(r'[\'"](https?://[a-zA-Z0-9.-]+/new-stream-embed/[^\'"]+)[\'"]', m_html))
+                
+                # If embed URL is directly referenced in JS
+                candidate_embed_base = re.search(r'[\'"](https?://[a-zA-Z0-9.-]+/new-stream-embed/)[\'"]', m_html)
+                if candidate_embed_base:
+                    test_id = item["extracted_ids"][0] if item["extracted_ids"] else item["backup_id"]
+                    if test_id:
+                        candidate_embed_urls.append(f"{candidate_embed_base.group(1)}{test_id}")
+                
+                for embed_url in deduplicate(candidate_embed_urls):
+                    if not embed_url.startswith('http'):
+                        if embed_url.startswith('//'):
+                            embed_url = 'https:' + embed_url
                         else:
-                            iframe_url = urljoin(item["full_m_url"], iframe_url)
+                            embed_url = urljoin(item["full_m_url"], embed_url)
                     
                     try:
-                        iframe_res = scraper.get(iframe_url, timeout=10)
-                        playlist_match = re.search(r'(https?://[a-zA-Z0-9.-]+/playlist/[a-zA-Z0-9_.-]+/load-playlist[^"\'\s>]*)', iframe_res.text)
+                        embed_res = scraper.get(embed_url, timeout=10)
+                        playlist_match = re.search(r'(https?://[a-zA-Z0-9.-]+/playlist/[a-zA-Z0-9_.-]+/load-playlist[^"\'\s>]*)', embed_res.text)
                         if playlist_match:
                             parsed_url = urlparse(playlist_match.group(1))
                             active_stream_domain = parsed_url.netloc
