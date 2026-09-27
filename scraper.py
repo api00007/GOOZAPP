@@ -11,7 +11,6 @@ from collections import OrderedDict
 from urllib.parse import urlparse, urljoin
 import cloudscraper
 
-# Settings fetched from environment variables
 BASE_URL = os.getenv("BASE_URL")
 DEFAULT_STREAM_DOMAIN = "chatgpt.hereisman.net"
 OUTPUT_FILE = "Goozapp.json"
@@ -21,11 +20,9 @@ def get_ist_time():
     return datetime.now(ist).strftime('%d/%m/%y %H:%M:%S IST')
 
 def log_to_console(message):
-    """Prints logs to sys.stderr so they appear in GitHub Actions but do not pollute the raw JSON output."""
     print(message, file=sys.stderr)
 
 def deduplicate(seq):
-    """Helper function to remove duplicates while preserving order."""
     seen = set()
     return [x for x in seq if not (x in seen or seen.add(x))]
 
@@ -73,7 +70,6 @@ def push_to_github():
         log_to_console(f"[ERROR] Push failed: {e}")
 
 def run_scraper():
-    # Verify if BASE_URL secret is provided
     if not BASE_URL:
         error_package = OrderedDict([
             ("Owner", "Ivan-FluX"),
@@ -88,7 +84,6 @@ def run_scraper():
     raw_matches = []
     active_stream_domain = ""
     
-    # Clean up base URL and support root/v8 automatically
     clean_base = BASE_URL.rstrip('/')
     if clean_base.endswith('/index1'):
         clean_base = clean_base[:-7]
@@ -99,7 +94,6 @@ def run_scraper():
         res = scraper.get(target_url, timeout=15)
         homepage_html = res.text
         
-        # If the root page didn't contain matches, try fallback endpoint /v8
         if 'list-group-item' not in homepage_html and not clean_base.endswith('/v8'):
             target_url = f"{clean_base}/v8"
             log_to_console(f"[*] Retrying with fallback endpoint: {target_url}")
@@ -118,16 +112,13 @@ def run_scraper():
         print(json.dumps(error_package, indent=4))
         return
 
-    # Extract all matches directly from list-group items
     matches = re.findall(r'<a class="list-group-item"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', homepage_html, re.S)
     log_to_console(f"[+] Total {len(matches)} raw matches found.")
     
     for m_url, m_text in matches:
-        # Skip matches that are already ended, finished, or final
         if re.search(r'\b(ended|finished|final)\b', m_text, re.I):
             continue
             
-        # Extract Category / League name from <strong> tag or fallback to URL
         cat_match = re.search(r'<strong>(.*?)</strong>', m_text, re.I)
         if cat_match:
             cat_name = cat_match.group(1).strip()
@@ -135,7 +126,6 @@ def run_scraper():
             cat_url_match = re.search(r'/tv-live/([^/]+)/', m_url)
             cat_name = cat_url_match.group(1).upper() if cat_url_match else "Live Sports"
 
-        # Clean match name by stripping logo spans, badges, and trailing colons
         temp_text = re.sub(r'<span[^>]*>\s*<img[^>]*>.*?</span>', '', m_text, flags=re.S | re.I)
         temp_text = re.sub(r'<strong[^>]*>.*?</strong>', '', temp_text, flags=re.S | re.I)
         temp_text = re.sub(r'<span[^>]*class=["\'][^"\']*time-badge[^"\']*["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
@@ -147,7 +137,6 @@ def run_scraper():
         
         full_m_url = m_url if m_url.startswith("http") else urljoin(clean_base, m_url)
         
-        # Extract numeric match ID from URL as backup
         match_id_search = re.search(r'/(\d+)/?$', full_m_url)
         match_id = match_id_search.group(1) if match_id_search else ""
         
@@ -159,37 +148,24 @@ def run_scraper():
             "extracted_ids": []
         })
 
-    # Pass 1: Scan active matches silently to find the streaming domain and stream IDs
     log_to_console(f"\n[*] Scanning {len(raw_matches)} matches for server IDs...")
     for item in raw_matches:
         log_to_console(f"  [-] Fetching page: {item['clean_rivals']}...")
         try:
-            # Safe delay to prevent Cloudflare rate-limits
             time.sleep(random.uniform(0.8, 1.5))
             m_res = scraper.get(item["full_m_url"], timeout=10)
             m_html = m_res.text
             
-            # Skip if match page states it is Final
             if re.search(r'\bFinal at\b', m_html, re.I):
                 log_to_console("    [!] Match is already final. Skipping stream extraction.")
                 continue
 
-            # Extract stream IDs from different potential patterns
             stream_ids = []
-            
-            # Pattern 1: changeStream(ID)
             stream_ids.extend(re.findall(r'changeStream\s*\(\s*[\'"]?([a-zA-Z0-9_-]+)[\'"]?\s*\)', m_html))
-            
-            # Pattern 2: stream-btn-ID
             stream_ids.extend(re.findall(r'stream-btn-([a-zA-Z0-9_-]+)', m_html))
-            
-            # Pattern 3: new-stream-embed/ID
             stream_ids.extend(re.findall(r'new-stream-embed/([a-zA-Z0-9_-]+)', m_html))
-            
-            # Pattern 4: any generic embed path
             stream_ids.extend(re.findall(r'embed/([a-zA-Z0-9_-]+)', m_html))
             
-            # Filter out non-ID javascript variables
             filtered_ids = [
                 s for s in stream_ids 
                 if s.lower() not in ('streamid', 'null', 'undefined', 'cx-iframe')
@@ -201,17 +177,11 @@ def run_scraper():
             else:
                 log_to_console("    [!] No stream buttons found in HTML.")
 
-            # Extract active stream domain from iframe or embed URL
             if not active_stream_domain:
                 candidate_embed_urls = []
-                
-                # Check static iframes
                 candidate_embed_urls.extend(re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', m_html, re.I))
-                
-                # Check dynamic embed URLs in script
                 candidate_embed_urls.extend(re.findall(r'[\'"](https?://[a-zA-Z0-9.-]+/new-stream-embed/[^\'"]+)[\'"]', m_html))
                 
-                # If embed URL is directly referenced in JS
                 candidate_embed_base = re.search(r'[\'"](https?://[a-zA-Z0-9.-]+/new-stream-embed/)[\'"]', m_html)
                 if candidate_embed_base:
                     test_id = item["extracted_ids"][0] if item["extracted_ids"] else item["backup_id"]
@@ -243,7 +213,6 @@ def run_scraper():
         active_stream_domain = DEFAULT_STREAM_DOMAIN
         log_to_console(f"\n[!] Using default domain: {active_stream_domain}")
 
-    # Pass 2: Generate final server-categorized links with Referer formatting
     all_live_matches = []
     
     for item in raw_matches:
@@ -254,13 +223,8 @@ def run_scraper():
             
         if ids_to_use:
             for index, stream_id in enumerate(ids_to_use, 1):
-                # Construct raw base link
                 raw_link = f"https://{active_stream_domain}/playlist/{stream_id}/load-playlist"
-                
-                # Remove trailing question mark and parameters, then strip trailing slashes if any
                 clean_link = raw_link.split('?')[0].rstrip('/')
-                
-                # Format final link with .m3u8 and the Referer pipe
                 final_link = f"{clean_link}.m3u8|Referer=https://gooz.aapmains.net"
                 
                 all_live_matches.append(OrderedDict([
@@ -270,7 +234,6 @@ def run_scraper():
                     ("Link", final_link)
                 ]))
 
-    # Structure final JSON package
     final_package = OrderedDict([
         ("Owner", "Ivan-FluX"),
         ("App name", "Goozapp-auto-scraper"),
@@ -279,14 +242,10 @@ def run_scraper():
         ("Live_Data", all_live_matches)
     ])
     
-    # Save output inside the Action runner locally before pushing
     with open(OUTPUT_FILE, "w") as f:
         json.dump(final_package, f, indent=4)
         
-    # Push to target repository
     push_to_github()
-    
-    # Print raw formatted JSON output to standard output only
     print(json.dumps(final_package, indent=4))
 
 if __name__ == "__main__":
