@@ -77,7 +77,7 @@ def run_scraper():
             ("Status", "Failed"),
             ("Error", "BASE_URL environment variable is missing. Please add BASE_URL to GitHub Secrets.")
         ])
-        print(json.dumps(error_package, indent=4))
+        print(json.dumps(error_package, indent=4, ensure_ascii=False))
         return
 
     scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
@@ -108,24 +108,24 @@ def run_scraper():
             ("Error", "Could not connect to the website. Possibly blocked by Cloudflare or network timeout."),
             ("Details", str(e))
         ])
-        print(json.dumps(error_package, indent=4))
+        print(json.dumps(error_package, indent=4, ensure_ascii=False))
         return
 
-    matches = re.findall(r'<a[^>]*class=["\'][^"\']*(?:game|list-group-item)[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', homepage_html, re.S)
+    matches = re.findall(r'(<a[^>]*class=["\'][^"\']*(?:game|list-group-item)[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>)(.*?)</a>', homepage_html, re.S)
     log_to_console(f"[+] Total {len(matches)} raw matches found.")
     
-    for m_url, m_text in matches:
+    for a_tag, m_url, m_text in matches:
         if re.search(r'\b(ended|finished|final)\b', m_text, re.I):
             continue
-            
-        cat_match = re.search(r'class=["\']league-tag["\'][^>]*>(.*?)</span>', m_text, re.S)
-        if cat_match:
-            cat_raw = re.sub(r'<[^>]+>', '', cat_match.group(1)).strip()
-            cat_name = cat_raw
+
+        sport_attr = re.search(r'data-sport=["\']([^"\']+)["\']', a_tag)
+        if sport_attr:
+            cat_name = sport_attr.group(1).strip()
         else:
-            cat_strong = re.search(r'<strong>(.*?)</strong>', m_text)
-            if cat_strong:
-                cat_name = cat_strong.group(1).strip()
+            clean_tag_text = re.sub(r'<span[^>]*class=["\']sport-icon["\'][^>]*>.*?</span>', '', m_text, flags=re.S)
+            cat_match = re.search(r'class=["\']league-tag["\'][^>]*>(.*?)</span>', clean_tag_text, re.S)
+            if cat_match:
+                cat_name = re.sub(r'<[^>]+>', '', cat_match.group(1)).strip()
             else:
                 cat_url_match = re.search(r'/(?:tv-live|watch|live)/([^/]+)/', m_url)
                 cat_name = cat_url_match.group(1).replace('-', ' ').title() if cat_url_match else "Live Sports"
@@ -140,14 +140,32 @@ def run_scraper():
             clean_rivals = re.sub(r'<[^>]+>', '', temp_text).strip()
         
         clean_rivals = clean_rivals.rstrip(':').strip()
+
+        if " vs " in clean_rivals:
+            parts = clean_rivals.split(" vs ", 1)
+            team_a = parts[0].strip()
+            team_b = parts[1].strip()
+        elif " at " in clean_rivals:
+            parts = clean_rivals.split(" at ", 1)
+            team_a = parts[0].strip()
+            team_b = parts[1].strip()
+        elif " - " in clean_rivals:
+            parts = clean_rivals.split(" - ", 1)
+            team_a = parts[0].strip()
+            team_b = parts[1].strip()
+        else:
+            team_a = clean_rivals
+            team_b = clean_rivals
+
         full_m_url = m_url if m_url.startswith("http") else urljoin(clean_base, m_url)
-        
         match_id_search = re.search(r'/(\d+)/?$', full_m_url)
         match_id = match_id_search.group(1) if match_id_search else ""
         
         raw_matches.append({
             "cat_name": cat_name,
             "clean_rivals": clean_rivals,
+            "team_a": team_a,
+            "team_b": team_b,
             "full_m_url": full_m_url,
             "backup_id": match_id,
             "extracted_ids": []
@@ -235,6 +253,8 @@ def run_scraper():
                 all_live_matches.append(OrderedDict([
                     ("Id", str(len(all_live_matches) + 1)),
                     ("Rivels", item["clean_rivals"]),
+                    ("Team A", item["team_a"]),
+                    ("Team B", item["team_b"]),
                     ("Title", f"{item['cat_name']} (S-{index})"),
                     ("Link", final_link)
                 ]))
@@ -247,11 +267,11 @@ def run_scraper():
         ("Live_Data", all_live_matches)
     ])
     
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(final_package, f, indent=4)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(final_package, f, indent=4, ensure_ascii=False)
         
     push_to_github()
-    print(json.dumps(final_package, indent=4))
+    print(json.dumps(final_package, indent=4, ensure_ascii=False))
 
 if __name__ == "__main__":
     run_scraper()
