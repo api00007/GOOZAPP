@@ -43,7 +43,7 @@ def push_to_github():
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             
-        clone_status = os.system(f"git clone {remote_url} {temp_dir}")
+        clone_status = os.system(f"git clone --depth 1 {remote_url} {temp_dir}")
         if clone_status != 0:
             raise Exception("Git Clone failed. Please check your token or repo permissions.")
         
@@ -55,7 +55,7 @@ def push_to_github():
         os.system(f'git config user.email "{GITHUB_EMAIL if GITHUB_EMAIL else "action@github.com"}"')
         os.system(f'git config user.name "{GITHUB_USER}"')
         os.system(f"git add {OUTPUT_FILE}")
-        os.system(f'git commit -m "Auto Update: {get_ist_time()}" || echo "No changes"')
+        os.system(f'git commit -m "Auto Update: {get_ist_time()}" --allow-empty')
         push_status = os.system("git push origin main")
         
         os.chdir(current_dir)
@@ -85,18 +85,17 @@ def run_scraper():
     active_stream_domain = ""
     
     clean_base = BASE_URL.rstrip('/')
-    if clean_base.endswith('/index1'):
-        clean_base = clean_base[:-7]
+    clean_base = re.sub(r'/(index1|v8|v12)/?$', '', clean_base)
 
-    target_url = clean_base
+    target_url = f"{clean_base}/v12"
     log_to_console(f"[*] Loading homepage: {target_url}")
     try:
         res = scraper.get(target_url, timeout=15)
         homepage_html = res.text
         
-        if 'list-group-item' not in homepage_html and not clean_base.endswith('/v8'):
-            target_url = f"{clean_base}/v8"
-            log_to_console(f"[*] Retrying with fallback endpoint: {target_url}")
+        if 'class="game"' not in homepage_html:
+            target_url = clean_base
+            log_to_console(f"[*] Fallback to root homepage: {target_url}")
             res = scraper.get(target_url, timeout=15)
             homepage_html = res.text
             
@@ -112,29 +111,35 @@ def run_scraper():
         print(json.dumps(error_package, indent=4))
         return
 
-    matches = re.findall(r'<a class="list-group-item"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', homepage_html, re.S)
+    matches = re.findall(r'<a[^>]*class=["\'][^"\']*(?:game|list-group-item)[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', homepage_html, re.S)
     log_to_console(f"[+] Total {len(matches)} raw matches found.")
     
     for m_url, m_text in matches:
         if re.search(r'\b(ended|finished|final)\b', m_text, re.I):
             continue
             
-        cat_match = re.search(r'<strong>(.*?)</strong>', m_text, re.I)
+        cat_match = re.search(r'class=["\']league-tag["\'][^>]*>(.*?)</span>', m_text, re.S)
         if cat_match:
-            cat_name = cat_match.group(1).strip()
+            cat_raw = re.sub(r'<[^>]+>', '', cat_match.group(1)).strip()
+            cat_name = cat_raw
         else:
-            cat_url_match = re.search(r'/tv-live/([^/]+)/', m_url)
-            cat_name = cat_url_match.group(1).upper() if cat_url_match else "Live Sports"
+            cat_strong = re.search(r'<strong>(.*?)</strong>', m_text)
+            if cat_strong:
+                cat_name = cat_strong.group(1).strip()
+            else:
+                cat_url_match = re.search(r'/(?:tv-live|watch|live)/([^/]+)/', m_url)
+                cat_name = cat_url_match.group(1).replace('-', ' ').title() if cat_url_match else "Live Sports"
 
-        temp_text = re.sub(r'<span[^>]*>\s*<img[^>]*>.*?</span>', '', m_text, flags=re.S | re.I)
-        temp_text = re.sub(r'<strong[^>]*>.*?</strong>', '', temp_text, flags=re.S | re.I)
-        temp_text = re.sub(r'<span[^>]*class=["\'][^"\']*time-badge[^"\']*["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
-        temp_text = re.sub(r'<span[^>]*class=["\'][^"\']*hd-text[^"\']*["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
+        matchup_match = re.search(r'class=["\']matchup["\'][^>]*>(.*?)</span>', m_text, re.S)
+        if matchup_match:
+            clean_rivals = re.sub(r'<[^>]+>', '', matchup_match.group(1)).strip()
+        else:
+            temp_text = re.sub(r'<span[^>]*class=["\']league-tag["\'][^>]*>.*?</span>', '', m_text, flags=re.S | re.I)
+            temp_text = re.sub(r'<span[^>]*class=["\']badge-time["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
+            temp_text = re.sub(r'<span[^>]*class=["\']watch["\'][^>]*>.*?</span>', '', temp_text, flags=re.S | re.I)
+            clean_rivals = re.sub(r'<[^>]+>', '', temp_text).strip()
         
-        clean_rivals = re.sub(r'<[^>]+>', '', temp_text)
-        clean_rivals = re.sub(r'\s+', ' ', clean_rivals).strip()
         clean_rivals = clean_rivals.rstrip(':').strip()
-        
         full_m_url = m_url if m_url.startswith("http") else urljoin(clean_base, m_url)
         
         match_id_search = re.search(r'/(\d+)/?$', full_m_url)
@@ -152,7 +157,7 @@ def run_scraper():
     for item in raw_matches:
         log_to_console(f"  [-] Fetching page: {item['clean_rivals']}...")
         try:
-            time.sleep(random.uniform(0.8, 1.5))
+            time.sleep(random.uniform(0.6, 1.2))
             m_res = scraper.get(item["full_m_url"], timeout=10)
             m_html = m_res.text
             
@@ -161,10 +166,10 @@ def run_scraper():
                 continue
 
             stream_ids = []
-            stream_ids.extend(re.findall(r'changeStream\s*\(\s*[\'"]?([a-zA-Z0-9_-]+)[\'"]?\s*\)', m_html))
-            stream_ids.extend(re.findall(r'stream-btn-([a-zA-Z0-9_-]+)', m_html))
-            stream_ids.extend(re.findall(r'new-stream-embed/([a-zA-Z0-9_-]+)', m_html))
-            stream_ids.extend(re.findall(r'embed/([a-zA-Z0-9_-]+)', m_html))
+            stream_ids.extend(re.findall(r'new-stream-embed/(\d+)', m_html))
+            stream_ids.extend(re.findall(r'changeStream\s*\(\s*[\'"]?(\d+)', m_html))
+            stream_ids.extend(re.findall(r'stream-btn-(\d+)', m_html))
+            stream_ids.extend(re.findall(r'embed/(\d+)', m_html))
             
             filtered_ids = [
                 s for s in stream_ids 
